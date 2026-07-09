@@ -1,0 +1,136 @@
+# docker-compose.yml
+#
+# Brings up the entire Real-Time Ride Demand Prediction Pipeline with a
+# single command: `docker compose up --build`.
+#
+# Startup order is enforced via depends_on + healthchecks (Section 22,
+# Docker) so, for example, the API never starts querying Postgres before
+# Postgres is actually accepting connections.
+
+version: "3.9"
+
+services:
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [ride-demand-net]
+
+  kafka:
+    image: bitnami/kafka:3.6
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_NUM_PARTITIONS: 8
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [ride-demand-net]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Migrations are auto-executed, in filename order, on first container start.
+      - ./db/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [ride-demand-net]
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file: .env
+    networks: [ride-demand-net]
+    restart: unless-stopped
+
+  streaming:
+    build:
+      context: .
+      dockerfile: streaming/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - spark_checkpoints:/app/checkpoints
+    networks: [ride-demand-net]
+    restart: unless-stopped
+
+  ml-scoring:
+    build:
+      context: .
+      dockerfile: ml/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    volumes:
+      - ml_artifacts:/app/ml/artifacts
+    networks: [ride-demand-net]
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    ports:
+      - "8000:8000"
+    networks: [ride-demand-net]
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    depends_on:
+      - backend
+    env_file: .env
+    environment:
+      API_BASE_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    networks: [ride-demand-net]
+    restart: unless-stopped
+
+networks:
+  ride-demand-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  spark_checkpoints:
+  ml_artifacts:
